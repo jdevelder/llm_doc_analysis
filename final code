@@ -1,0 +1,451 @@
+import requests
+from bs4 import BeautifulSoup
+import json
+import time
+import csv
+import os
+import re
+import pandas as pd
+
+
+def get_cik_from_ticker(ticker):
+    url = f"https://www.sec.gov/files/company_tickers.json"
+    headers = {'User-Agent': 'Jacqueline Develder ja426730@ucf.edu'}
+    
+    try:
+        response = requests.get(url, headers=headers)
+        
+        if response.status_code == 200:
+            data = json.loads(response.text)
+            
+            for entry in data.values():
+                if entry['ticker'].lower() == ticker.lower():
+                    return str(entry['cik_str']).zfill(10), entry['title']
+        else:
+            print(f"Failed to get data: HTTP Status {response.status_code}")
+    except Exception as e:
+        print(f"Error: {str(e)}")
+    return None
+
+def get_recent_8k_filings(cik, count=5):
+    search_url = f"https://www.sec.gov/cgi-bin/browse-edgar?action=getcompany&CIK={cik}&type=8-K&count={count}&output=atom"
+    headers = {'User-Agent': 'Jacqueline Develder ja426730@ucf.edu'}
+    
+    try:
+        time.sleep(0.5)
+        response = requests.get(search_url, headers=headers)
+        
+        if response.status_code == 200:
+            soup = BeautifulSoup(response.content, 'xml')
+            entries = soup.find_all('entry')
+            
+            filings = []
+            for entry in entries:
+                filings.append({
+                    'title': entry.title.text if entry.title else "N/A",
+                    'link': entry.link['href'] if entry.link and 'href' in entry.link.attrs else "N/A",
+                    'updated': entry.updated.text if entry.updated else "N/A"
+                })
+            
+            return filings
+        else:
+            print(f"Failed to get filings: HTTP Status {response.status_code}")
+    except Exception as e:
+        print(f"Error: {str(e)}")
+    
+    return []
+
+def fetch_8k_filings(ticker, count=5):
+    cik, company_name = get_cik_from_ticker(ticker)
+    if not cik:
+        print(f"CIK not found for ticker: {ticker}")
+        return [], None
+    
+    print(f"CIK for {ticker.upper()}: {cik} ({company_name})")
+    filings = get_recent_8k_filings(cik, count)
+    
+    if not filings:
+        print("No recent 8-K filings found.")
+        return [], None
+    
+    return filings, company_name
+
+
+def get_filing_content(filing_url):
+    txt_url = filing_url.replace('-index.htm', '.txt')
+    headers = {'User-Agent': 'Jacqueline Develder ja426730@ucf.edu'}
+    
+    try:
+        time.sleep(0.5)
+        
+        response = requests.get(txt_url, headers=headers)
+        
+        if response.status_code == 200:
+            content = response.text
+            
+            text_sections = []
+            start_idx = 0
+            
+            while True:
+                text_start = content.find('<TEXT>', start_idx)
+                if text_start == -1:
+                    break
+                
+                text_end = content.find('</TEXT>', text_start)
+                if text_end == -1:
+                    break
+                
+                text_section = content[text_start+6:text_end].strip()
+                
+                if text_section.lower().startswith('<html'):
+                    html_soup = BeautifulSoup(text_section, 'html.parser')
+                    cleaned_text = html_soup.get_text(separator=' ', strip=True)
+                    text_sections.append(cleaned_text)
+                else:
+                    text_sections.append(text_section)
+                
+                start_idx = text_end + 7
+            
+            return "\n\n".join(text_sections)
+        else:
+            print(f"Failed to get document: HTTP Status {response.status_code}")
+    except Exception as e:
+        print(f"Error fetching filing content: {e}")
+    
+    return None
+
+
+def get_available_ollama_models():
+    try:
+        url = "http://localhost:11434/api/tags"
+        response = requests.get(url)
+        
+        if response.status_code == 200:
+            models = response.json()
+            return [model['name'] for model in models['models']]
+        else:
+            print(f"Error getting Ollama models: Status code {response.status_code}")
+            return []
+    except Exception as e:
+        print(f"Exception while getting Ollama models: {e}")
+        return []
+
+def query_ollama(prompt):
+    available_models = get_available_ollama_models()
+    print(f"Available Ollama models: {available_models}")
+    
+    model_preferences = ["llama3", "llama3.1", "llama3.2", "llama2", "deepseek-r1", "mistral", "neural-chat", "mixtral"]
+    
+    model_to_use = None
+    for model in model_preferences:
+        for available_model in available_models:
+            if model in available_model:
+                model_to_use = available_model
+                break
+        if model_to_use:
+            break
+    
+    if not model_to_use and available_models:
+        model_to_use = available_models[0]
+    
+    if not model_to_use:
+        print("No models available in Ollama")
+        return "NO_PRODUCT_FOUND"
+    
+    print(f"Using Ollama model: {model_to_use}")
+    
+    try:
+        url = "http://localhost:11434/api/generate"
+        
+        data = {
+            "model": model_to_use,
+            "prompt": prompt,
+            "stream": False
+        }
+        
+        response = requests.post(url, json=data)
+        
+        if response.status_code == 200:
+            result = response.json()
+            return result["response"]
+        else:
+            print(f"Error querying Ollama: Status code {response.status_code}")
+            print(f"Response: {response.text}")
+            return "Error: Failed to get proper response from Ollama"
+    except Exception as e:
+        print(f"Exception while querying Ollama: {e}")
+        print("Falling back to keyword-based extraction...")
+        return "NO_PRODUCT_FOUND"
+
+
+def is_financial_report(text):
+    financial_terms = [
+        "financial results", "earnings", "quarterly results", "quarterly report",
+        "fiscal quarter", "fiscal year", "revenue", "net income", "dividend",
+        "financial statements", "consolidated statements", "balance sheet",
+        "income statement", "cash flow", "GAAP", "non-GAAP", "quarter ended",
+        "year ended", "year-end", "reported earnings"
+    ]
+    
+    term_count = sum(1 for term in financial_terms if term in text.lower())
+    return term_count >= 2  
+
+def keyword_based_product_extraction(filing_text, company_name, ticker, filing_date):
+    if is_financial_report(filing_text[:1000]): 
+        print("  This appears to be a financial report, not a product announcement.")
+        return None
+    
+    text_lower = filing_text.lower()
+    
+    product_keywords = [
+        "new product", "introducing", "introduces", "unveiled", "unveils", 
+        "launched", "launches", "new solution", "new device", "new service",
+        "new application", "new app", "new hardware", "new software", "new platform",
+        "new technology", "new feature", "innovation", "next generation", "next-gen"
+    ]
+    
+    product_keyword_found = any(keyword in text_lower for keyword in product_keywords)
+    
+    if not product_keyword_found:
+        return None
+    
+    sentences = re.split(r'(?<=[.!?])\s+', filing_text)
+    
+    product_sentences = []
+    for sentence in sentences:
+        if any(keyword in sentence.lower() for keyword in product_keywords):
+            if not any(term in sentence.lower() for term in ["financial results", "earnings", "quarterly results"]):
+                product_sentences.append(sentence)
+    
+    if not product_sentences:
+        return None
+    
+    target_sentence = product_sentences[0]
+    
+    product_name = "New Product"  
+    
+    generic_categories = [
+        "product", "device", "service", "application", "platform", 
+        "solution", "technology", "software", "system", "tool"
+    ]
+    
+    for category in generic_categories:
+        if category in target_sentence.lower():
+            pattern = r"(?:new|the new|its new|latest)?\s*(\w+\s*)?" + category + r"(\s*\w+)?"
+            match = re.search(pattern, target_sentence.lower())
+            if match:
+                before = match.group(1) or ""
+                after = match.group(2) or ""
+                product_name = (before + category + after).strip().title()
+                break
+    
+    if product_name == "New Product" or product_name == "Unknown Product":
+        print("  Couldn't extract a specific product name. Ignoring.")
+        return None
+    
+    description = target_sentence.strip()
+    if len(description) > 180:
+        description = description[:177] + "..."
+    
+    return {
+        "company_name": company_name,
+        "stock_name": ticker,
+        "filing_time": filing_date,
+        "new_product": product_name,
+        "product_description": description
+    }
+
+def extract_product_info(filing_text, company_name, ticker, filing_date):
+    if is_financial_report(filing_text[:1000]):
+        print("  This appears to be a financial report, not a product announcement.")
+        return None
+    
+    try:
+        prompt = f"""
+You are an expert in analyzing SEC 8-K filings and identifying new product announcements.
+
+I'll provide you with text from an 8-K filing from {company_name} ({ticker}). 
+
+Your task is to identify ONLY IF there is a specific announcement of a NEW PRODUCT, NEW SERVICE, or NEW TECHNOLOGY. 
+Do NOT identify financial results, earnings announcements, management changes, or other non-product related announcements.
+
+IMPORTANT: Financial results, quarterly earnings reports, and similar financial announcements are NOT product announcements.
+
+Here's the 8-K filing text:
+---
+{filing_text[:5000]} 
+---
+
+If there is a SPECIFIC new product or service announcement (with a clear product name), respond in this format:
+PRODUCT_FOUND
+Product Name: [specific product name]
+Product Description: [brief description under 180 characters]
+
+If there is no specific new product announcement, or if this is just a financial report or earnings announcement, respond with just this single line:
+NO_PRODUCT_FOUND
+"""
+        
+        response = query_ollama(prompt)
+        
+        if "PRODUCT_FOUND" in response:
+            product_name_match = re.search(r"Product Name: (.+?)(?:\n|$)", response)
+            product_name = product_name_match.group(1).strip() if product_name_match else "Unknown Product"
+            
+            product_desc_match = re.search(r"Product Description: (.+?)(?:\n|$)", response)
+            product_description = product_desc_match.group(1).strip() if product_desc_match else "No description available"
+            
+            if product_name == "Unknown Product" or product_description == "No description available":
+                print("  LLM identified a product but couldn't extract proper name or description. Ignoring.")
+                return None
+            
+            if len(product_description) > 180:
+                product_description = product_description[:177] + "..."
+            
+            financial_terms = ["financial results", "earnings", "quarterly", "fiscal"]
+            if any(term in product_name.lower() for term in financial_terms):
+                print("  LLM incorrectly identified financial results as a product. Ignoring.")
+                return None
+            
+            return {
+                "company_name": company_name,
+                "stock_name": ticker,
+                "filing_time": filing_date,
+                "new_product": product_name,
+                "product_description": product_description
+            }
+        
+    except Exception as e:
+        print(f"Error with Ollama: {e}")
+        print("Falling back to keyword extraction...")
+    
+    return keyword_based_product_extraction(filing_text, company_name, ticker, filing_date)
+
+
+def process_company_filings(ticker, count=5):
+    filings, company_name = fetch_8k_filings(ticker, count)
+    
+    if not filings:
+        return []
+    
+    results = []
+    for i, filing in enumerate(filings):
+        print(f"\nProcessing Filing #{i+1}: {filing['title']}")
+        
+        filing_date = filing['updated'].split('T')[0]
+        
+        content = get_filing_content(filing['link'])
+        
+        if not content:
+            print("  Could not extract content from this filing.")
+            continue
+        
+        product_info = extract_product_info(content, company_name, ticker, filing_date)
+        
+        if product_info:
+            results.append(product_info)
+            print(f"  Found product announcement: {product_info['new_product']}")
+            print(f"  Description: {product_info['product_description']}")
+        else:
+            print("  No product announcement found in this filing.")
+    
+    return results
+
+def save_to_csv(results, output_file='product_announcements.csv'):
+    fields = ['company_name', 'stock_name', 'filing_time', 'new_product', 'product_description']
+    
+    with open(output_file, 'w', newline='', encoding='utf-8') as csvfile:
+        writer = csv.DictWriter(csvfile, fieldnames=fields)
+        writer.writeheader()
+        writer.writerows(results)
+    
+    print(f"\nSaved {len(results)} product announcements to {output_file}")
+
+def get_sp500_companies():
+    sp500_tickers = [
+        'AAPL', 'MSFT', 'AMZN', 'NVDA', 'GOOGL', 'META', 'GOOG', 'BRK-B', 'LLY', 'AVGO',
+        'TSLA', 'JPM', 'V', 'UNH', 'ADBE', 'COST', 'WMT', 'MA', 'PG', 'HD',
+        'XOM', 'MRK', 'CVX', 'ABBV', 'CRM', 'NFLX', 'ACN', 'ORCL', 'BAC', 'KO',
+        'PFE', 'PEP', 'AMD', 'TMO', 'CSCO', 'MCD', 'CMCSA', 'INTC', 'ABT', 'DIS',
+        'INTU', 'VZ', 'QCOM', 'DHR', 'WFC', 'TXN', 'AMGN', 'COP', 'IBM', 'LOW',
+        'PM', 'CAT', 'NKE', 'UPS', 'GE', 'RTX', 'HON', 'LIN', 'SBUX', 'AMAT',
+        'SPGI', 'BA', 'DE', 'BKNG', 'MS', 'ISRG', 'TJX', 'UNP', 'GS', 'MDT',
+        'NOW', 'GILD', 'MDLZ', 'PGR', 'AXP', 'LRCX', 'CVS', 'ADI', 'AMT', 'BMY',
+        'SCHW', 'SYK', 'VRTX', 'ADP', 'C', 'MMC', 'BLK', 'ELV', 'NEE', 'MO',
+        'ETN', 'ZTS', 'SLB', 'CB', 'EOG', 'EQIX', 'BSX', 'ITW', 'TMUS', 'REGN',
+        'DUK', 'AON', 'KLAC', 'LMT', 'SO', 'HUM', 'TT', 'ICE', 'CSX', 'BDX',
+        'CI', 'CME', 'PLD', 'MPC', 'SNPS', 'FI', 'APD', 'CDNS', 'MCO', 'APH',
+        'MU', 'FCX', 'CL', 'MNST', 'DXCM', 'GD', 'ADSK', 'MMM', 'NSC', 'SHW',
+        'ANET', 'PXD', 'AIG', 'MSI', 'DOW', 'VLO', 'EMR', 'ENPH', 'PCAR', 'PANW',
+        'PSX', 'MSCI', 'BIIB', 'ROP', 'PSA', 'MCK', 'CCI', 'MCHP', 'KMB', 'USB',
+        'MAR', 'TDG', 'ADM', 'WM', 'JCI', 'AZO', 'CTAS', 'AJG', 'CHTR', 'ORLY',
+        'TGT', 'AEP', 'KMI', 'PH', 'EXC', 'PNC', 'GWW', 'IDXX', 'SPG', 'HLT',
+        'WELL', 'CARR', 'ROST', 'COF', 'HCA', 'DHI', 'FTNT', 'OKE', 'CMG', 'EA',
+        'ALB', 'PRU', 'D', 'SRE', 'EW', 'MTD', 'BK', 'DG', 'PAYX', 'ABC',
+        'RSG', 'KDP', 'A', 'TFC', 'TRV', 'LHX', 'HSY', 'PCG', 'NEM', 'CTSH',
+        'STZ', 'GIS', 'OXY', 'GM', 'VICI', 'MRNA', 'ILMN', 'WMB', 'AME', 'O',
+        'ODFL', 'XEL', 'HPQ', 'WBD', 'CSGP', 'FAST', 'DD', 'LVS', 'AMP', 'ALL',
+        'TEL', 'F', 'YUM', 'APO', 'ROK', 'KR', 'HES', 'CPRT', 'ON', 'IQV',
+        'AWK', 'NXPI', 'NUE', 'CMI', 'BF-B', 'VRSK', 'OTIS', 'ED', 'WST', 'WEC',
+        'DLR', 'PPG', 'DLTR', 'ECL', 'DFS', 'FDX', 'ES', 'CDW', 'PEG', 'WTW',
+        'VMC', 'CBRE', 'SYY', 'MLM', 'ATO', 'GEHC', 'CEG', 'RCL', 'BKR', 'GLW',
+        'HAL', 'TSCO', 'WBA', 'IR', 'FIS', 'EXR', 'ETR', 'RMD', 'ULTA', 'EL',
+        'NTRS', 'HBAN', 'J', 'AXON', 'IT', 'CF', 'OVV', 'ZBH', 'MKC', 'GPN',
+        'AMAT', 'EIX', 'URI', 'GRMN', 'MTB', 'GPC', 'KHC', 'VLTO', 'ACGL', 'EFX',
+        'APTV', 'MPWR', 'STLD', 'STT', 'CNC', 'AFL', 'DVN', 'EBAY', 'ANSS', 'ALGN',
+        'TROW', 'PODD', 'TTWO', 'JBHT', 'LEN', 'FRC', 'HPOB', 'TDY', 'FNF', 'AVB',
+        'HOLX', 'TYL', 'IP', 'EG', 'KIM', 'LNG', 'LYB', 'CTVA', 'CAH', 'FE',
+        'PWR', 'CHD', 'BRO', 'WAT', 'RF', 'TSN', 'RJF', 'PPL', 'K', 'BLDR',
+        'L', 'CNP', 'AMCR', 'IFF', 'VRSN', 'HRL', 'KEYS', 'STE', 'HUBB', 'DAL',
+        'PAYC', 'DTE', 'BALL', 'INVH', 'BBY', 'ROL', 'PHM', 'FANG', 'EQR', 'WDAY',
+        'QRVO', 'WY', 'DOV', 'CLX', 'IRM', 'PCG', 'NTAP', 'BR', 'COO', 'UDR',
+        'SWKS', 'ARE', 'HPE', 'DGX', 'ELV', 'STX', 'JEC', 'AES', 'LIN', 'TFX',
+        'MET', 'MOH', 'PFG', 'CFG', 'SEDG', 'GEN', 'CPT', 'RHI', 'PTC', 'TRGP',
+        'LUV', 'EXPD', 'EXPE', 'ETR', 'HWM', 'WDC', 'CINF', 'PEAK', 'FLT', 'LKQ',
+        'POOL', 'ESS', 'CTLT', 'XYL', 'MAS', 'HST', 'MGM', 'HIG', 'NVR', 'PARA',
+        'TXT', 'DRI', 'SWK', 'LDOS', 'DPZ', 'WWD', 'APA', 'IPG', 'FOXA', 'CTRA',
+        'NRG', 'REG', 'VFC', 'NDAQ', 'PKG', 'ZBRA', 'BG', 'LNT', 'INCY', 'SJM',
+        'OMC', 'KMX', 'CPB', 'ETSY', 'CCL', 'AKAM', 'UAL', 'TAP', 'CMS', 'BXP',
+        'JKHY', 'WRB', 'CZR', 'BWA', 'MRO', 'GL', 'WHR', 'HII', 'ERIE', 'MOS',
+        'RCL', 'AIZ', 'BBWI', 'KO', 'MAA', 'PKI', 'TECH', 'CBOE', 'HSIC', 'CHRW',
+        'EVRG', 'AOS', 'PNR', 'JNPR', 'PNW', 'BEN', 'AVY', 'WYNN', 'NI', 'RYN',
+        'TPL', 'HAS', 'SEE', 'FRT', 'FMC', 'UHS', 'FFIV', 'ALLE', 'LEG', 'LUMN',
+        'AAP', 'CRL'
+    ]
+    
+    print(f"Using predefined list of {len(sp500_tickers)} S&P 500 tickers")
+    return sp500_tickers
+
+def main():
+    sp500_tickers = get_sp500_companies()
+    
+    all_results = []
+    max_product_announcements = 100
+    
+    for ticker in sp500_tickers:
+        print(f"\n=== Processing {ticker} ===")
+        
+        if len(all_results) >= max_product_announcements:
+            print(f"\nReached target of {max_product_announcements} product announcements. Stopping.")
+            break
+            
+        results = process_company_filings(ticker, count=5)
+        all_results.extend(results)
+        
+        if len(all_results) >= max_product_announcements:
+            all_results = all_results[:max_product_announcements]
+            print(f"\nReached target of {max_product_announcements} product announcements. Stopping.")
+            break
+        
+        print(f"Total product announcements found so far: {len(all_results)}/{max_product_announcements}")
+    
+    if all_results:
+        save_to_csv(all_results)
+        
+        df = pd.DataFrame(all_results)
+        print("\nExtracted Product Announcements:")
+        print(df)
+    else:
+        print("\nNo product announcements found in any of the processed filings.")
+
+if __name__ == "__main__":
+    main()
