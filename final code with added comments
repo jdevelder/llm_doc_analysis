@@ -1,3 +1,4 @@
+# import required libraries
 import requests
 from bs4 import BeautifulSoup
 import json
@@ -7,7 +8,7 @@ import os
 import re
 import pandas as pd
 
-
+# function to retrieve CIK 
 def get_cik_from_ticker(ticker):
     url = f"https://www.sec.gov/files/company_tickers.json"
     headers = {'User-Agent': 'Jacqueline Develder ja426730@ucf.edu'}
@@ -27,6 +28,7 @@ def get_cik_from_ticker(ticker):
         print(f"Error: {str(e)}")
     return None
 
+# functions to retrieve 8k & info within 8k
 def get_recent_8k_filings(cik, count=5):
     search_url = f"https://www.sec.gov/cgi-bin/browse-edgar?action=getcompany&CIK={cik}&type=8-K&count={count}&output=atom"
     headers = {'User-Agent': 'Jacqueline Develder ja426730@ucf.edu'}
@@ -114,7 +116,7 @@ def get_filing_content(filing_url):
     
     return None
 
-
+# query for ollama models on local host
 def get_available_ollama_models():
     try:
         url = "http://localhost:11434/api/tags"
@@ -177,7 +179,7 @@ def query_ollama(prompt):
         print("Falling back to keyword-based extraction...")
         return "NO_PRODUCT_FOUND"
 
-
+# pre-llm processing - financial reports, key words for product announcement)
 def is_financial_report(text):
     financial_terms = [
         "financial results", "earnings", "quarterly results", "quarterly report",
@@ -255,6 +257,7 @@ def keyword_based_product_extraction(filing_text, company_name, ticker, filing_d
         "product_description": description
     }
 
+# ollama processing if file is deemed as not a financial report 
 def extract_product_info(filing_text, company_name, ticker, filing_date):
     if is_financial_report(filing_text[:1000]):
         print("  This appears to be a financial report, not a product announcement.")
@@ -349,7 +352,7 @@ def process_company_filings(ticker, count=5):
             print("  No product announcement found in this filing.")
     
     return results
-
+# function to save to csv
 def save_to_csv(results, output_file='product_announcements.csv'):
     fields = ['company_name', 'stock_name', 'filing_time', 'new_product', 'product_description']
     
@@ -360,6 +363,7 @@ def save_to_csv(results, output_file='product_announcements.csv'):
     
     print(f"\nSaved {len(results)} product announcements to {output_file}")
 
+# defining tickers for S&P 500
 def get_sp500_companies():
     sp500_tickers = [
         'AAPL', 'MSFT', 'AMZN', 'NVDA', 'GOOGL', 'META', 'GOOG', 'BRK-B', 'LLY', 'AVGO',
@@ -415,6 +419,7 @@ def get_sp500_companies():
     print(f"Using predefined list of {len(sp500_tickers)} S&P 500 tickers")
     return sp500_tickers
 
+# main
 def main():
     sp500_tickers = get_sp500_companies()
     
@@ -447,5 +452,6 @@ def main():
     else:
         print("\nNo product announcements found in any of the processed filings.")
 
+# run main, and let the code run until it reaches 100 product announcements :)
 if __name__ == "__main__":
     main()
